@@ -1468,6 +1468,42 @@ status_t SurfaceFlinger::getDisplayStats(const sp<IBinder>& displayToken,
     return NO_ERROR;
 }
 
+bool SurfaceFlinger::shouldDeferDisplayModeChange(const sp<DisplayDevice>& display) const {
+    return mDeferRefreshRateWhenOff &&
+            (display->getPowerMode() != hal::PowerMode::ON ||
+             mPendingDisplayPowerModeChanges.contains(display->getPhysicalId()));
+}
+
+void SurfaceFlinger::applyDeferredDisplayMode(PhysicalDisplayId displayId) {
+    if (!mDeferRefreshRateWhenOff) return;
+
+    const auto display = getDisplayDeviceLocked(displayId);
+    if (!display) {
+        mDeferredDisplayModes.erase(displayId);
+        return;
+    }
+    if (shouldDeferDisplayModeChange(display)) return;
+
+    auto request = mDisplayModeController.getDesiredMode(displayId);
+    if (const auto deferred = mDeferredDisplayModes.get(displayId)) {
+        request = std::move(deferred->get());
+    }
+    mDeferredDisplayModes.erase(displayId);
+
+    if (!request) {
+        // HWC may have lost a mode accepted before suspend, without receiving another request.
+        request = display::DisplayModeRequest{
+                .mode = mDisplayModeController.getActiveMode(displayId)};
+    }
+    request->emitEvent = true;
+    request->force = true;
+
+    // Start a fresh transition, including resync, instead of merging with a pre-suspend request.
+    mDisplayModeController.clearDesiredMode(displayId);
+    ALOGI("Reapplying display mode after power-on: %s", to_string(*request).c_str());
+    setDesiredMode(std::move(*request));
+}
+
 void SurfaceFlinger::setDesiredMode(display::DisplayModeRequest desiredMode) {
     const auto mode = desiredMode.mode;
     const auto displayId = mode.modePtr->getPhysicalDisplayId();
@@ -1489,12 +1525,10 @@ void SurfaceFlinger::setDesiredMode(display::DisplayModeRequest desiredMode) {
         return;
     }
     const auto display = getDisplayDeviceLocked(displayId);
-    if (mDeferRefreshRateWhenOff &&
-        (display->getPowerMode() == hal::PowerMode::OFF ||
-         display->getPowerMode() == hal::PowerMode::DOZE)) {
-        ALOGI("%s: deferring because display is off/dozing (powerMode=%d): %s", __func__,
+    if (shouldDeferDisplayModeChange(display)) {
+        ALOGI("%s: deferring until hardware power-on completes (powerMode=%d): %s", __func__,
               static_cast<int>(display->getPowerMode()), to_string(mode).c_str());
-        mLastActiveMode = mode;
+        mDeferredDisplayModes.emplace_or_replace(displayId, std::move(desiredMode));
         return;
     }
 
@@ -1731,6 +1765,17 @@ void SurfaceFlinger::initiateDisplayModeChanges() {
                 ? mDisplayModeController.getDisplayIdForRequest(
                           initialDesiredMode.displaySynchronizationToken)
                 : std::vector<PhysicalDisplayId>({initialDisplayId});
+        // A request can have been queued while ON, before a later power transition. Check
+        // every display before consuming any request, so a synchronized bundle stays intact.
+        if (mDeferRefreshRateWhenOff &&
+            std::any_of(bundledModesetDisplaysIds.begin(), bundledModesetDisplaysIds.end(),
+                        [this](PhysicalDisplayId id) FTL_FAKE_GUARD(mStateLock) {
+                            const auto display = getDisplayDeviceLocked(id);
+                            return display && shouldDeferDisplayModeChange(display);
+                        })) {
+            continue;
+        }
+
         processedDisplayIds.insert(processedDisplayIds.end(), bundledModesetDisplaysIds.begin(),
                                    bundledModesetDisplaysIds.end());
 
@@ -4636,6 +4681,8 @@ void SurfaceFlinger::processHotplugDisconnect(PhysicalDisplayId displayId,
     const auto& display = displayOpt->get();
 
     mCurrentState.displays.erase(display.token());
+    mDeferredDisplayModes.erase(displayId);
+    mPendingDisplayPowerModeChanges.erase(displayId);
     mPhysicalDisplays.erase(displayId);
 }
 
@@ -6838,6 +6885,12 @@ ftl::FinalizerStd SurfaceFlinger::makePowerModeAsyncFinalizer(PhysicalDisplayId 
 
         ALOGD("Finished setting power mode %d on physical display %s", mode,
               to_string(displayId).c_str());
+
+        ftl::FakeGuard guard(mStateLock);
+        mPendingDisplayPowerModeChanges.erase(displayId);
+        if (mode == hal::PowerMode::ON) {
+            applyDeferredDisplayMode(displayId);
+        }
     });
 }
 
@@ -6873,6 +6926,12 @@ SurfaceFlinger::setPhysicalDisplayPowerModeAsync(const sp<DisplayDevice>& displa
             physicalDisplayOpt.transform(&PhysicalDisplay::isInternal).value_or(false);
 
     mPowerModeChangeInProgress = true;
+    {
+        ftl::FakeGuard guard(mStateLock);
+        if (mDeferRefreshRateWhenOff) {
+            mPendingDisplayPowerModeChanges.try_emplace(displayId);
+        }
+    }
 
     const bool couldRefresh = display->isRefreshable();
     display->setPowerMode(mode);
@@ -6925,17 +6984,6 @@ SurfaceFlinger::setPhysicalDisplayPowerModeAsync(const sp<DisplayDevice>& displa
                                                        .set_power_mode_async()) {
                                                // Hardware op completed, set to new mode for good.
                                                display->setPowerMode(mode);
-                                           }
-                                           ftl::FakeGuard guard(mStateLock);
-                                           if (mLastActiveMode) {
-                                               ALOGI("Deferred active mode change pending, "
-                                                     "applying now");
-                                               const auto deferredMode = *mLastActiveMode;
-                                               mLastActiveMode = std::nullopt;
-                                               setDesiredMode(
-                                                       {.mode = deferredMode,
-                                                        .emitEvent = true,
-                                                        .force = true});
                                            }
                                            if (mode != hal::PowerMode::DOZE_SUSPEND) {
                                                const bool enable =
@@ -7001,17 +7049,6 @@ SurfaceFlinger::setPhysicalDisplayPowerModeAsync(const sp<DisplayDevice>& displa
                                                mScheduler->resyncToHardwareVsync(displayId,
                                                                                  kAllowToEnable,
                                                                                  activeMode.get());
-                                           }
-                                           ftl::FakeGuard guard(mStateLock);
-                                           if (mode == hal::PowerMode::ON && mLastActiveMode) {
-                                               ALOGI("Deferred active mode change pending, "
-                                                     "applying now (DOZE->ON)");
-                                               const auto deferredMode = *mLastActiveMode;
-                                               mLastActiveMode = std::nullopt;
-                                               setDesiredMode({
-                                                       .mode = deferredMode,
-                                                       .emitEvent = true,
-                                                       .force = true});
                                            }
                                        })};
     } else if (mode == hal::PowerMode::DOZE_SUSPEND) {

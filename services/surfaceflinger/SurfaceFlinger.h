@@ -761,6 +761,8 @@ private:
     bool mHdrSdrRatioOverlay = false;
 
     void setDesiredMode(display::DisplayModeRequest) REQUIRES(mStateLock);
+    bool shouldDeferDisplayModeChange(const sp<DisplayDevice>&) const REQUIRES(mStateLock);
+    void applyDeferredDisplayMode(PhysicalDisplayId) REQUIRES(mStateLock);
 
     status_t setActiveModeFromBackdoor(const sp<display::DisplayToken>&, DisplayModeId, Fps minFps,
                                        Fps maxFps);
@@ -1659,7 +1661,9 @@ private:
     bool mLumaSampling = true;
 
     bool mDeferRefreshRateWhenOff = false;
-    std::optional<scheduler::FrameRateMode> mLastActiveMode GUARDED_BY(mStateLock);
+    ui::PhysicalDisplayMap<PhysicalDisplayId, display::DisplayModeRequest> mDeferredDisplayModes
+            GUARDED_BY(mStateLock);
+    ui::PhysicalDisplaySet<PhysicalDisplayId> mPendingDisplayPowerModeChanges GUARDED_BY(mStateLock);
 
     sp<RegionSamplingThread> mRegionSamplingThread;
     sp<FpsReporter> mFpsReporter;
