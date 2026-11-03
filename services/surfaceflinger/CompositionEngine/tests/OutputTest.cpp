@@ -3638,6 +3638,7 @@ struct OutputComposeSurfacesTest : public testing::Test {
                 std::unique_ptr<DisplayColorProfile>(mDisplayColorProfile));
         mOutput.setRenderSurfaceForTest(std::unique_ptr<RenderSurface>(mRenderSurface));
         mOutput.cacheClientCompositionRequests(MAX_CLIENT_COMPOSITION_CACHE_SIZE);
+        EXPECT_CALL(mOutput, setExpensiveRenderingExpected(false)).Times(testing::AnyNumber());
 
         mOutput.mState.orientedDisplaySpace.setContent(kDefaultOutputFrame);
         mOutput.mState.layerStackSpace.setContent(kDefaultOutputViewport);
@@ -3921,7 +3922,7 @@ TEST_F(OutputComposeSurfacesTest, skipDuplicateClientCompositionRequests) {
     EXPECT_CALL(*mRenderSurface, dequeueBuffer(_)).WillRepeatedly(Return(mOutputBuffer));
     EXPECT_CALL(mRenderEngine, drawLayers(_, ElementsAre(r1, r2), _, _))
             .WillOnce(Return(ByMove(ftl::yield<FenceResult>(Fence::NO_FENCE))));
-    EXPECT_CALL(mOutput, setExpensiveRenderingExpected(false));
+    EXPECT_CALL(mOutput, setExpensiveRenderingExpected(false)).Times(2);
 
     verify().execute().expectAFenceWasReturned();
     EXPECT_FALSE(mOutput.mState.reusedClientComposition);
@@ -4556,17 +4557,18 @@ struct OutputComposeSurfacesTest_SetsExpensiveRendering : public OutputComposeSu
     }
 };
 
-TEST_F(OutputComposeSurfacesTest_SetsExpensiveRendering, IfExepensiveOutputDataspaceIsUsed) {
+TEST_F(OutputComposeSurfacesTest_SetsExpensiveRendering, ReleasesHintForColorConversionWithoutBlur) {
     mOutput.mState.dataspace = kExpensiveOutputDataspace;
 
     LayerFE::LayerSettings layerSettings;
+    layerSettings.sourceDataspace = ui::Dataspace::V0_SRGB;
     EXPECT_CALL(mOutput, generateClientCompositionRequests(_, kExpensiveOutputDataspace, _))
             .WillOnce(Return(std::vector<LayerFE::LayerSettings>{layerSettings}));
 
     // For this test, we also check the call order of key functions.
     InSequence seq;
 
-    EXPECT_CALL(mOutput, setExpensiveRenderingExpected(true));
+    EXPECT_CALL(mOutput, setExpensiveRenderingExpected(false));
     EXPECT_CALL(mRenderEngine, drawLayers(_, _, _, _))
             .WillOnce(Return(ByMove(ftl::yield<FenceResult>(Fence::NO_FENCE))));
 

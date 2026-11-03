@@ -1543,12 +1543,10 @@ std::optional<base::unique_fd> Output::composeSurfaces(
                                             clientCompositionLayers);
     }
 
-    // Blur shaders are expensive, so boost the GPU frequency and reset it afterwards to save battery.
-    // A color space conversion alone is cheap and would hold the boost through all GPU composition.
+    // Blur shaders are expensive. Update the hint in both directions so a transition to
+    // non-blurred GPU composition releases the boost without waiting for hardware composition.
     const bool expensiveRenderingExpected = mLayerRequestingBackgroundBlur != nullptr;
-    if (expensiveRenderingExpected) {
-        setExpensiveRenderingExpected(true);
-    }
+    setExpensiveRenderingExpected(expensiveRenderingExpected);
 
     std::vector<renderengine::LayerSettings> clientRenderEngineLayers;
     clientRenderEngineLayers.reserve(clientCompositionLayers.size());
